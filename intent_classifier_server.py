@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-HTTP Intent Classification Server
-Simple REST API server that handles intent classification
-Run with: python intent_server_http.py
+Improved Semantic Intent Classification Server
+Uses OpenAI embeddings + configurable LLM models for classification
 """
 
 from fastapi import FastAPI, HTTPException
@@ -12,27 +11,13 @@ import uvicorn
 import json
 import os
 import sys
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import re
 import logging
-
-# Install required packages if not available
-def install_packages():
-    packages = ["fastapi", "uvicorn", "scikit-learn", "numpy", "python-dotenv"]
-    for package in packages:
-        try:
-            if package == "scikit-learn":
-                import sklearn
-            elif package == "python-dotenv":
-                import dotenv
-            else:
-                __import__(package)
-        except ImportError:
-            print(f"Installing {package}...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-install_packages()
+import openai
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import anthropic
 
 # Load environment variables
 try:
@@ -41,22 +26,14 @@ try:
 except:
     pass
 
-# Import after installation
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("intent-server")
+logger = logging.getLogger("semantic-intent-server")
 
 # Configuration
 SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.getenv('SERVER_PORT', '8000'))
-DEFAULT_THRESHOLD = float(os.getenv('INTENT_THRESHOLD_DEFAULT', '0.3'))
-MAX_FEATURES = int(os.getenv('INTENT_MAX_FEATURES', '5000'))
-NGRAM_MIN = int(os.getenv('INTENT_NGRAM_MIN', '1'))
-NGRAM_MAX = int(os.getenv('INTENT_NGRAM_MAX', '3'))
+DEFAULT_THRESHOLD = float(os.getenv('INTENT_THRESHOLD_DEFAULT', '0.75'))
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
 
 # Pydantic models for API
@@ -66,111 +43,553 @@ class QAData(BaseModel):
 class ClassifyRequest(BaseModel):
     query: str
     threshold: Optional[float] = None
+    model_provider: Optional[str] = "anthropic"  # Default to anthropic since OpenAI isn't working
+    model_name: Optional[str] = "claude-3-haiku-20240307"  # Safe default
 
-class TopMatchesRequest(BaseModel):
-    query: str
-    top_k: Optional[int] = 5
-
-class IntentByIdRequest(BaseModel):
-    qid: str
-
-class IntentMatcher:
-    """Intent classification using TF-IDF and cosine similarity"""
+class SemanticIntentMatcher:
+    """Semantic intent classification using embeddings + configurable LLM"""
     
     def __init__(self, qa_data: List[Dict]):
         self.qa_data = qa_data
-        self.vectorizer = TfidfVectorizer(
-            stop_words='english',
-            lowercase=True,
-            ngram_range=(NGRAM_MIN, NGRAM_MAX),
-            max_features=MAX_FEATURES
-        )
-        self._prepare_vectors()
+        self.openai_client = None
+        self.anthropic_client = None
+        self.embeddings = []
+        self.question_texts = []
+        self.qid_mapping = {}
+        
+        self._init_clients()
+        self._build_semantic_index()
         
         # Metrics tracking
         self.metrics = {
             'total_queries': 0,
             'successful_matches': 0,
             'failed_matches': 0,
-            'avg_confidence': 0.0
+            'avg_confidence': 0.0,
+            'embedding_retrievals': 0,
+            'llm_validations': 0,
+            'openai_calls': 0,
+            'anthropic_calls': 0
         }
+        
+        logger.info(f"Initialized Semantic Intent Matcher with {len(qa_data)} Q&A pairs")
     
-    def _prepare_vectors(self):
-        """Prepare TF-IDF vectors for all questions"""
-        all_questions = []
-        self.question_map = {}
-        
-        for idx, item in enumerate(self.qa_data):
-            questions = item.get('q', [])
-            for q in questions:
-                all_questions.append(q.lower().strip())
-                self.question_map[len(all_questions) - 1] = idx
-        
-        if all_questions:
-            self.question_vectors = self.vectorizer.fit_transform(all_questions)
+    def _init_clients(self):
+        """Initialize AI clients"""
+        # OpenAI client
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if openai_key:
+            try:
+                self.openai_client = openai.OpenAI(api_key=openai_key)
+                logger.info("OpenAI client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
         else:
-            self.question_vectors = None
-            
-        logger.info(f"Prepared vectors for {len(all_questions)} questions from {len(self.qa_data)} Q&A pairs")
+            logger.warning("OPENAI_API_KEY not found in environment")
+        
+        # Anthropic client
+        anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+        if anthropic_key:
+            try:
+                self.anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
+                logger.info("Anthropic client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Anthropic client: {e}")
+        else:
+            logger.warning("ANTHROPIC_API_KEY not found in environment")
     
-    def find_best_match(self, user_query: str, threshold: float = None) -> Tuple[Optional[Dict], float]:
-        """Find the best matching Q&A pair for the user query"""
+    def _get_embedding(self, text: str) -> np.ndarray:
+        """Get OpenAI embedding for text"""
+        if not self.openai_client:
+            raise Exception("OpenAI client not available for embeddings")
+        
+        try:
+            response = self.openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text.replace('\n', ' ')
+            )
+            return np.array(response.data[0].embedding)
+        except Exception as e:
+            logger.error(f"Embedding error: {e}")
+            raise e
+    
+    def _build_semantic_index(self):
+        """Build semantic embedding index (fallback to text matching if OpenAI unavailable)"""
+        if not self.openai_client:
+            logger.warning("OpenAI client not available - skipping embeddings, will use text-based fallback")
+            # Just prepare question texts for fallback matching
+            for i, item in enumerate(self.qa_data):
+                qid = item.get('qid', f'Q{i+1}')
+                questions = item.get('q', [])
+                title = item.get('title', '')
+                
+                combined_text = ' '.join(questions)
+                if title:
+                    combined_text += f' {title}'
+                
+                self.question_texts.append(combined_text.lower())
+                self.qid_mapping[len(self.question_texts) - 1] = qid
+            
+            logger.info(f"Prepared {len(self.question_texts)} Q&A items for text-based matching (fast upload)")
+            return
+            
+        logger.info("Building semantic embedding index (this may take a moment)...")
+        
+        # Extract all questions and create mapping
+        for i, item in enumerate(self.qa_data):
+            qid = item.get('qid', f'Q{i+1}')
+            questions = item.get('q', [])
+            title = item.get('title', '')
+            
+            # Combine questions and title for better matching
+            combined_text = ' '.join(questions)
+            if title:
+                combined_text += f' {title}'
+            
+            self.question_texts.append(combined_text)
+            self.qid_mapping[len(self.question_texts) - 1] = qid
+            
+            # Get embedding with shorter timeout for faster failure
+            try:
+                embedding = self._get_embedding(combined_text)
+                self.embeddings.append(embedding)
+                if i % 10 == 0:  # Progress indicator
+                    logger.info(f"Generated embeddings for {i+1}/{len(self.qa_data)} items")
+            except Exception as e:
+                logger.warning(f"Failed to get embedding for QID {qid}: {e}")
+                # Use zero vector as fallback
+                self.embeddings.append(np.zeros(1536))
+        
+        if len(self.embeddings) > 0:
+            self.embeddings = np.array(self.embeddings)
+            logger.info(f"Built semantic index for {len(self.embeddings)} Q&A items")
+        else:
+            logger.warning("No embeddings generated, will use text-based fallback")
+    
+    def _retrieve_candidates_fallback(self, user_query: str, top_k: int = 5) -> List[Dict]:
+        """Fallback candidate retrieval using text similarity when embeddings unavailable"""
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        try:
+            # Create TF-IDF vectorizer as fallback
+            vectorizer = TfidfVectorizer(
+                max_features=1000,
+                stop_words='english',
+                ngram_range=(1, 2),
+                min_df=1
+            )
+            
+            # Add user query to texts for vectorization
+            all_texts = self.question_texts + [user_query.lower()]
+            vectors = vectorizer.fit_transform(all_texts)
+            
+            # Calculate similarities (last vector is user query)
+            query_vector = vectors[-1]
+            text_vectors = vectors[:-1]
+            similarities = cosine_similarity(query_vector, text_vectors).flatten()
+            
+            # Get top-k candidates
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            
+            candidates = []
+            for idx in top_indices:
+                similarity_score = similarities[idx]
+                qid = self.qid_mapping[idx]
+                
+                # Find the original Q&A item
+                qa_item = None
+                for item in self.qa_data:
+                    if item.get('qid') == qid:
+                        qa_item = item
+                        break
+                
+                if qa_item:
+                    candidates.append({
+                        'qid': qid,
+                        'similarity': float(similarity_score),
+                        'qa_item': qa_item
+                    })
+            
+            return candidates
+            
+        except Exception as e:
+            logger.error(f"Fallback candidate retrieval error: {e}")
+            return []
+
+    def _retrieve_candidates(self, user_query: str, top_k: int = 5) -> List[Dict]:
+        """Retrieve top-k most similar candidates using semantic embeddings or fallback"""
+        self.metrics['embedding_retrievals'] += 1
+        
+        # Try semantic embeddings first
+        if self.openai_client and len(self.embeddings) > 0:
+            try:
+                # Get embedding for user query
+                query_embedding = self._get_embedding(user_query)
+                
+                # Calculate cosine similarities
+                similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+                
+                # Get top-k candidates
+                top_indices = np.argsort(similarities)[::-1][:top_k]
+                
+                candidates = []
+                for idx in top_indices:
+                    similarity_score = similarities[idx]
+                    qid = self.qid_mapping[idx]
+                    
+                    # Find the original Q&A item
+                    qa_item = None
+                    for item in self.qa_data:
+                        if item.get('qid') == qid:
+                            qa_item = item
+                            break
+                    
+                    if qa_item:
+                        candidates.append({
+                            'qid': qid,
+                            'similarity': float(similarity_score),
+                            'qa_item': qa_item
+                        })
+                
+                logger.debug(f"Retrieved {len(candidates)} candidates using semantic embeddings")
+                return candidates
+                
+            except Exception as e:
+                logger.warning(f"Semantic embedding retrieval failed: {e}, falling back to text similarity")
+        
+        # Fallback to text-based similarity
+        logger.info("Using text-based fallback for candidate retrieval")
+        return self._retrieve_candidates_fallback(user_query, top_k)
+    
+    def _llm_validate_candidates(self, user_query: str, candidates: List[Dict], 
+                               model_provider: str = "openai", model_name: str = "gpt-4o-mini") -> Dict:
+        """Use configurable LLM to validate and select the best candidate"""
+        self.metrics['llm_validations'] += 1
+        
+        logger.info(f"LLM validation starting with {model_provider}/{model_name}")
+        logger.info(f"Available clients - OpenAI: {self.openai_client is not None}, Anthropic: {self.anthropic_client is not None}")
+        
+        # Prepare candidate information for LLM
+        candidates_text = ""
+        for i, candidate in enumerate(candidates):
+            qa_item = candidate['qa_item']
+            qid = candidate['qid']
+            similarity = candidate['similarity']
+            questions = qa_item.get('q', [])
+            title = qa_item.get('title', '')
+            answer_preview = qa_item.get('a', '')[:120] + "..." if len(qa_item.get('a', '')) > 120 else qa_item.get('a', '')
+            
+            candidates_text += f"\nCandidate {i+1}:\n"
+            candidates_text += f"- QID: {qid}\n"
+            candidates_text += f"- Semantic Similarity: {similarity:.3f}\n"
+            candidates_text += f"- Title: {title}\n"
+            candidates_text += f"- Sample Questions: {', '.join(questions[:3])}\n"
+            candidates_text += f"- Answer Preview: {answer_preview}\n"
+            candidates_text += "---\n"
+        
+        prompt = f"""You are an expert DMV customer service intent classifier. You have been given semantically similar candidates from an embedding search. Your job is to determine if any truly match the user's intent.
+
+USER QUERY: "{user_query}"
+
+SEMANTIC CANDIDATES:
+{candidates_text}
+
+INSTRUCTIONS:
+1. Understand what the user is actually trying to accomplish
+2. Evaluate each candidate for true semantic relevance
+3. Consider context, intent, and implied meaning
+4. If there's a genuine match, return that QID with appropriate confidence
+5. If no candidate truly matches the user's intent, return null
+6. Be conservative - only high confidence matches should pass
+
+CRITICAL: Respond with ONLY valid JSON, no additional text before or after.
+
+{{
+    "selected_qid": "QID_FROM_CANDIDATES or null",
+    "confidence": 0.85,
+    "reasoning": "Detailed explanation of why this candidate matches or why none match",
+    "user_intent": "Clear description of what the user wants to accomplish"
+}}
+
+Return only the JSON object above, nothing else."""
+
+        try:
+            if model_provider.lower() == "anthropic" and self.anthropic_client:
+                logger.info("Using Anthropic client for validation")
+                self.metrics['anthropic_calls'] += 1
+                response = self.anthropic_client.messages.create(
+                    model=model_name,
+                    max_tokens=300,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                content = response.content[0].text.strip()
+                logger.info(f"Anthropic response received: {content[:100]}...")
+                
+            elif model_provider.lower() == "openai" and self.openai_client:
+                logger.info("Using OpenAI client for validation")
+                self.metrics['openai_calls'] += 1
+                response = self.openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are an expert intent classification system. Always respond with valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=300
+                )
+                content = response.choices[0].message.content.strip()
+                logger.info(f"OpenAI response received: {content[:100]}...")
+                
+            else:
+                logger.error(f"No available client for {model_provider}")
+                return {
+                    "selected_qid": None,
+                    "confidence": 0.0,
+                    "reasoning": f"No {model_provider} client available",
+                    "user_intent": "Unable to determine - no client"
+                }
+            
+            # Extract JSON from response - more robust parsing
+            logger.info(f"Raw LLM response: {content}")
+            
+            # Try to find JSON in the response
+            json_content = content
+            
+            # Remove markdown code blocks
+            if content.startswith('```json'):
+                json_content = content[7:]
+                if json_content.endswith('```'):
+                    json_content = json_content[:-3]
+            elif content.startswith('```'):
+                json_content = content[3:]
+                if json_content.endswith('```'):
+                    json_content = json_content[:-3]
+            
+            # Find JSON object boundaries
+            json_content = json_content.strip()
+            
+            # Look for the first { and last } to extract just the JSON part
+            start_idx = json_content.find('{')
+            end_idx = json_content.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                json_content = json_content[start_idx:end_idx+1]
+            
+            logger.info(f"Extracted JSON content: {json_content}")
+            
+            try:
+                parsed_result = json.loads(json_content)
+            except json.JSONDecodeError as parse_error:
+                logger.error(f"JSON parsing still failed: {parse_error}")
+                logger.error(f"Attempted to parse: {json_content}")
+                
+                # Fallback: try to extract fields manually if JSON is malformed
+                try:
+                    # Look for key patterns in the text
+                    selected_qid = None
+                    confidence = 0.0
+                    reasoning = "JSON parsing failed, but extracted from text"
+                    user_intent = "Unable to determine"
+                    
+                    # Try to extract QID
+                    if '"selected_qid"' in content:
+                        qid_match = re.search(r'"selected_qid":\s*"([^"]*)"', content)
+                        if qid_match:
+                            selected_qid = qid_match.group(1)
+                            if selected_qid.lower() == "null":
+                                selected_qid = None
+                    
+                    # Try to extract confidence
+                    if '"confidence"' in content:
+                        conf_match = re.search(r'"confidence":\s*([0-9.]+)', content)
+                        if conf_match:
+                            confidence = float(conf_match.group(1))
+                    
+                    # Try to extract reasoning
+                    if '"reasoning"' in content:
+                        reason_match = re.search(r'"reasoning":\s*"([^"]*)"', content)
+                        if reason_match:
+                            reasoning = reason_match.group(1)
+                    
+                    return {
+                        "selected_qid": selected_qid,
+                        "confidence": confidence,
+                        "reasoning": f"Manual extraction: {reasoning}",
+                        "user_intent": user_intent
+                    }
+                    
+                except Exception as fallback_error:
+                    logger.error(f"Fallback extraction failed: {fallback_error}")
+                    return {
+                        "selected_qid": None,
+                        "confidence": 0.0,
+                        "reasoning": f"Complete JSON parsing failure: {str(parse_error)}",
+                        "user_intent": "Unable to determine"
+                    }
+            
+            logger.info(f"Successfully parsed LLM result: {parsed_result}")
+            return parsed_result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}")
+            logger.error(f"Raw content was: {content}")
+            return {
+                "selected_qid": None,
+                "confidence": 0.0,
+                "reasoning": f"JSON parsing failed: {str(e)}",
+                "user_intent": "Unable to determine - parsing error"
+            }
+        except Exception as e:
+            logger.error(f"LLM validation error: {e}")
+            return {
+                "selected_qid": None,
+                "confidence": 0.0,
+                "reasoning": f"LLM validation failed: {str(e)}",
+                "user_intent": "Unable to determine - LLM error"
+            }
+    
+    def match_intent(self, user_query: str, threshold: float = None, 
+                    model_provider: str = "openai", model_name: str = "gpt-4o-mini") -> Dict:
+        """Semantic intent matching: embedding retrieval + LLM validation"""
         if threshold is None:
             threshold = DEFAULT_THRESHOLD
-            
-        if self.question_vectors is None or self.question_vectors.shape[0] == 0:
-            return None, 0.0
         
-        # Vectorize user query
-        user_vector = self.vectorizer.transform([user_query.lower().strip()])
-        
-        # Calculate cosine similarities
-        similarities = cosine_similarity(user_vector, self.question_vectors).flatten()
-        
-        # Get best match
-        best_idx = np.argmax(similarities)
-        best_score = similarities[best_idx]
-        
-        # Update metrics
         self.metrics['total_queries'] += 1
-        if best_score >= threshold:
-            self.metrics['successful_matches'] += 1
-        else:
+        
+        logger.info(f"=== INTENT MATCHING DEBUG ===")
+        logger.info(f"Query: '{user_query}'")
+        logger.info(f"Requested: {model_provider}/{model_name}")
+        logger.info(f"Threshold: {threshold}")
+        logger.info(f"Available clients - OpenAI: {self.openai_client is not None}, Anthropic: {self.anthropic_client is not None}")
+        
+        # Check if requested provider is available
+        if model_provider.lower() == "openai" and not self.openai_client:
+            logger.warning("OpenAI requested but not available, falling back to Anthropic")
+            if self.anthropic_client:
+                model_provider = "anthropic"
+                model_name = "claude-3-haiku-20240307"  # Safe default
+            else:
+                logger.error("No AI providers available at all!")
+                self.metrics['failed_matches'] += 1
+                return {
+                    "status": "error",
+                    "confidence": 0.0,
+                    "message": "No AI providers available",
+                    "model_used": "none"
+                }
+        
+        if model_provider.lower() == "anthropic" and not self.anthropic_client:
+            logger.warning("Anthropic requested but not available, falling back to OpenAI")
+            if self.openai_client:
+                model_provider = "openai"
+                model_name = "gpt-4o-mini"  # Safe default
+            else:
+                logger.error("No AI providers available at all!")
+                self.metrics['failed_matches'] += 1
+                return {
+                    "status": "error",
+                    "confidence": 0.0,
+                    "message": "No AI providers available",
+                    "model_used": "none"
+                }
+        
+        logger.info(f"Using: {model_provider}/{model_name}")
+        
+        try:
+            # Step 1: Candidate retrieval (embedding or fallback)
+            logger.info("Step 1: Retrieving candidates...")
+            candidates = self._retrieve_candidates(user_query, top_k=5)
+            logger.info(f"Found {len(candidates)} candidates")
+            
+            if not candidates:
+                logger.warning("No candidates found!")
+                self.metrics['failed_matches'] += 1
+                return {
+                    "status": "no_candidates",
+                    "confidence": 0.0,
+                    "message": "No similar candidates found",
+                    "model_used": f"{model_provider}/{model_name}"
+                }
+            
+            # Log candidate info
+            for i, candidate in enumerate(candidates):
+                logger.info(f"Candidate {i+1}: {candidate['qid']} (similarity: {candidate['similarity']:.3f})")
+            
+            # Step 2: LLM validation with available model
+            logger.info("Step 2: LLM validation...")
+            validation_result = self._llm_validate_candidates(
+                user_query, candidates, model_provider, model_name
+            )
+            logger.info(f"LLM validation complete: {validation_result}")
+            
+            selected_qid = validation_result.get('selected_qid')
+            confidence = float(validation_result.get('confidence', 0.0))
+            reasoning = validation_result.get('reasoning', '')
+            user_intent = validation_result.get('user_intent', '')
+            
+            logger.info(f"Selected QID: {selected_qid}, Confidence: {confidence}, Threshold: {threshold}")
+            
+            # Update average confidence
+            total = self.metrics['total_queries']
+            self.metrics['avg_confidence'] = (
+                (self.metrics['avg_confidence'] * (total - 1) + confidence) / total
+            )
+            
+            if selected_qid and confidence >= threshold:
+                logger.info("Match found and passes threshold!")
+                # Find the selected Q&A item
+                selected_qa = None
+                for candidate in candidates:
+                    if candidate['qid'] == selected_qid:
+                        selected_qa = candidate['qa_item']
+                        break
+                
+                if selected_qa:
+                    self.metrics['successful_matches'] += 1
+                    return {
+                        "status": "match_found",
+                        "qid": selected_qid,
+                        "confidence": confidence,
+                        "user_intent": user_intent,
+                        "reasoning": reasoning,
+                        "qa_item": selected_qa,
+                        "method": "hybrid_retrieval_llm",
+                        "model_used": f"{model_provider}/{model_name}",
+                        "candidates_considered": [c['qid'] for c in candidates],
+                        "retrieval_method": "semantic" if self.openai_client and len(self.embeddings) > 0 else "text_fallback"
+                    }
+                else:
+                    logger.warning(f"Selected QID {selected_qid} not found in candidates")
+            else:
+                logger.info(f"No match: QID={selected_qid}, confidence={confidence} < threshold={threshold}")
+            
+            # No good match found
             self.metrics['failed_matches'] += 1
-        
-        # Update average confidence
-        total = self.metrics['total_queries']
-        self.metrics['avg_confidence'] = (
-            (self.metrics['avg_confidence'] * (total - 1) + best_score) / total
-        )
-        
-        if DEBUG_MODE:
-            logger.debug(f"Query: '{user_query}' | Best score: {best_score:.3f} | Threshold: {threshold}")
-        
-        if best_score >= threshold:
-            qa_idx = self.question_map[best_idx]
-            return self.qa_data[qa_idx], best_score
-        
-        return None, best_score
-
-    def get_top_matches(self, user_query: str, top_k: int = 5) -> List[Tuple[Dict, float]]:
-        """Get top K matching Q&A pairs"""
-        if self.question_vectors is None:
-            return []
-        
-        user_vector = self.vectorizer.transform([user_query.lower().strip()])
-        similarities = cosine_similarity(user_vector, self.question_vectors).flatten()
-        
-        # Get top k indices
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-        
-        results = []
-        for idx in top_indices:
-            if similarities[idx] > 0:
-                qa_idx = self.question_map[idx]
-                results.append((self.qa_data[qa_idx], similarities[idx]))
-        
-        return results
+            return {
+                "status": "no_match",
+                "confidence": confidence,
+                "user_intent": user_intent,
+                "reasoning": reasoning,
+                "message": "No sufficiently confident intent match found",
+                "model_used": f"{model_provider}/{model_name}",
+                "candidates_considered": [c['qid'] for c in candidates],
+                "retrieval_method": "semantic" if self.openai_client and len(self.embeddings) > 0 else "text_fallback"
+            }
+                
+        except Exception as e:
+            logger.error(f"Intent matching error: {e}")
+            logger.error(f"Exception type: {type(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            self.metrics['failed_matches'] += 1
+            return {
+                "status": "error", 
+                "message": f"Error processing query: {str(e)}",
+                "confidence": 0.0,
+                "model_used": f"{model_provider}/{model_name}"
+            }
 
 def clean_template_syntax(text: str) -> str:
     """Clean template syntax from answer text"""
@@ -185,13 +604,13 @@ def clean_template_syntax(text: str) -> str:
     return text
 
 # Global intent matcher instance
-intent_matcher: Optional[IntentMatcher] = None
+intent_matcher: Optional[SemanticIntentMatcher] = None
 
 # FastAPI app
 app = FastAPI(
-    title="Intent Classification Server",
-    description="REST API for intent classification and routing",
-    version="1.0.0"
+    title="Semantic Intent Classification Server",
+    description="Semantic intent classification using embeddings + configurable LLM validation",
+    version="4.0.0"
 )
 
 # Add CORS middleware
@@ -207,42 +626,51 @@ app.add_middleware(
 async def root():
     """Health check endpoint"""
     return {
-        "message": "Intent Classification Server is running",
+        "message": "Semantic Intent Classification Server is running",
         "status": "healthy",
-        "data_loaded": intent_matcher is not None
+        "data_loaded": intent_matcher is not None,
+        "method": "semantic_embedding_llm"
     }
 
 @app.get("/health")
 async def health_check():
     """Detailed health check"""
+    clients_status = {
+        "openai_available": intent_matcher.openai_client is not None if intent_matcher else False,
+        "anthropic_available": intent_matcher.anthropic_client is not None if intent_matcher else False
+    }
+    
     return {
         "status": "healthy",
         "data_loaded": intent_matcher is not None,
         "total_qa_pairs": len(intent_matcher.qa_data) if intent_matcher else 0,
+        "method": "semantic_embedding_llm",
+        "clients": clients_status,
         "config": {
             "default_threshold": DEFAULT_THRESHOLD,
-            "max_features": MAX_FEATURES,
-            "ngram_range": f"{NGRAM_MIN}-{NGRAM_MAX}",
             "debug_mode": DEBUG_MODE
         }
     }
 
 @app.post("/load_data")
 async def load_qa_data(data: QAData):
-    """Load Q&A data for intent classification"""
+    """Load Q&A data for semantic intent classification"""
     global intent_matcher
     
     try:
         qa_data = data.qna
-        intent_matcher = IntentMatcher(qa_data)
+        intent_matcher = SemanticIntentMatcher(qa_data)
         
-        logger.info(f"Loaded {len(qa_data)} Q&A pairs")
+        logger.info(f"Loaded {len(qa_data)} Q&A pairs for semantic intent matching")
         
         return {
             "status": "success",
-            "message": f"Successfully loaded {len(qa_data)} Q&A pairs for intent classification",
+            "message": f"Successfully loaded {len(qa_data)} Q&A pairs for semantic intent classification",
             "total_pairs": len(qa_data),
-            "total_questions": sum(len(item.get('q', [])) for item in qa_data)
+            "total_questions": sum(len(item.get('q', [])) for item in qa_data),
+            "method": "semantic_embedding_llm",
+            "openai_available": intent_matcher.openai_client is not None,
+            "anthropic_available": intent_matcher.anthropic_client is not None
         }
         
     except Exception as e:
@@ -251,7 +679,7 @@ async def load_qa_data(data: QAData):
 
 @app.post("/classify")
 async def classify_intent(request: ClassifyRequest):
-    """Classify user query intent"""
+    """Classify user query intent using semantic approach with configurable models"""
     global intent_matcher
     
     if not intent_matcher:
@@ -259,104 +687,53 @@ async def classify_intent(request: ClassifyRequest):
     
     try:
         threshold = request.threshold if request.threshold is not None else DEFAULT_THRESHOLD
-        best_match, confidence = intent_matcher.find_best_match(request.query, threshold)
+        model_provider = request.model_provider or "openai"
+        model_name = request.model_name or "gpt-4o-mini"
         
-        if best_match:
+        result = intent_matcher.match_intent(
+            request.query, threshold, model_provider, model_name
+        )
+        
+        if result["status"] == "match_found":
             # Found a good match
-            raw_answer = best_match.get('a', 'No answer available')
+            qa_item = result["qa_item"]
+            raw_answer = qa_item.get('a', 'No answer available')
             cleaned_answer = clean_template_syntax(raw_answer)
             
-            result = {
+            return {
                 "status": "match_found",
-                "confidence": confidence,
+                "confidence": result["confidence"],
                 "threshold": threshold,
+                "user_intent": result["user_intent"],
+                "reasoning": result["reasoning"],
+                "method": "semantic_embedding_llm",
+                "model_used": result["model_used"],
+                "candidates_considered": result.get("candidates_considered", []),
                 "intent": {
-                    "qid": best_match.get('qid', ''),
-                    "title": best_match.get('title', ''),
-                    "questions": best_match.get('q', []),
+                    "qid": qa_item.get('qid', ''),
+                    "title": qa_item.get('title', ''),
+                    "questions": qa_item.get('q', []),
                     "answer": cleaned_answer,
-                    "buttons": best_match.get('r', {}).get('buttons', [])
+                    "buttons": qa_item.get('r', {}).get('buttons', [])
                 }
             }
         else:
-            # No good match
-            result = {
-                "status": "no_match",
-                "confidence": confidence,
+            # No good match or error
+            return {
+                "status": result["status"],
+                "confidence": result.get("confidence", 0.0),
                 "threshold": threshold,
-                "message": "No intent match found. Please try rephrasing your question."
+                "user_intent": result.get("user_intent", ""),
+                "reasoning": result.get("reasoning", ""),
+                "method": "semantic_embedding_llm",
+                "model_used": result.get("model_used", f"{model_provider}/{model_name}"),
+                "message": result.get("message", "No intent match found"),
+                "candidates_considered": result.get("candidates_considered", [])
             }
-        
-        return result
         
     except Exception as e:
         logger.error(f"Error classifying intent: {e}")
         raise HTTPException(status_code=500, detail=f"Error classifying intent: {str(e)}")
-
-@app.post("/top_matches")
-async def get_top_matches(request: TopMatchesRequest):
-    """Get top K similar intents for a query"""
-    global intent_matcher
-    
-    if not intent_matcher:
-        raise HTTPException(status_code=400, detail="No Q&A data loaded. Please load data first.")
-    
-    try:
-        matches = intent_matcher.get_top_matches(request.query, request.top_k)
-        
-        result = {
-            "query": request.query,
-            "top_matches": []
-        }
-        
-        for match, score in matches:
-            result["top_matches"].append({
-                "confidence": score,
-                "qid": match.get('qid', ''),
-                "title": match.get('title', ''),
-                "sample_question": match.get('q', [''])[0] if match.get('q') else '',
-                "answer_preview": clean_template_syntax(match.get('a', ''))[:200] + "..." if len(match.get('a', '')) > 200 else clean_template_syntax(match.get('a', ''))
-            })
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error getting top matches: {e}")
-        raise HTTPException(status_code=500, detail=f"Error getting top matches: {str(e)}")
-
-@app.post("/intent_by_id")
-async def get_intent_by_id(request: IntentByIdRequest):
-    """Get specific intent by question ID"""
-    global intent_matcher
-    
-    if not intent_matcher:
-        raise HTTPException(status_code=400, detail="No Q&A data loaded. Please load data first.")
-    
-    try:
-        # Find intent by QID
-        for item in intent_matcher.qa_data:
-            if item.get('qid') == request.qid:
-                result = {
-                    "found": True,
-                    "intent": {
-                        "qid": item.get('qid', ''),
-                        "title": item.get('title', ''),
-                        "questions": item.get('q', []),
-                        "answer": clean_template_syntax(item.get('a', '')),
-                        "buttons": item.get('r', {}).get('buttons', [])
-                    }
-                }
-                return result
-        
-        # Not found
-        return {
-            "found": False,
-            "message": f"No intent found with QID: {request.qid}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error looking up intent: {e}")
-        raise HTTPException(status_code=500, detail=f"Error looking up intent: {str(e)}")
 
 @app.get("/stats")
 async def get_stats():
@@ -374,71 +751,37 @@ async def get_stats():
         "total_qa_pairs": len(intent_matcher.qa_data),
         "total_questions": sum(len(item.get('q', [])) for item in intent_matcher.qa_data),
         "metrics": intent_matcher.metrics,
+        "method": "semantic_embedding_llm",
         "config": {
             "default_threshold": DEFAULT_THRESHOLD,
-            "max_features": MAX_FEATURES,
-            "ngram_range": f"{NGRAM_MIN}-{NGRAM_MAX}",
             "debug_mode": DEBUG_MODE
         }
     }
 
-@app.post("/reset_metrics")
-async def reset_metrics():
-    """Reset server metrics"""
-    global intent_matcher
-    
-    if not intent_matcher:
-        raise HTTPException(status_code=400, detail="No Q&A data loaded")
-    
-    intent_matcher.metrics = {
-        'total_queries': 0,
-        'successful_matches': 0,
-        'failed_matches': 0,
-        'avg_confidence': 0.0
-    }
-    
-    return {"message": "Metrics reset successfully"}
-
-@app.get("/qa_data")
-async def get_qa_data():
-    """Get all loaded Q&A data"""
-    global intent_matcher
-    
-    if not intent_matcher:
-        raise HTTPException(status_code=400, detail="No Q&A data loaded")
-    
-    return {
-        "qna": intent_matcher.qa_data
-    }
-
 def main():
     """Run the server"""
-    logger.info(f"Starting Intent Classification HTTP Server...")
+    logger.info(f"Starting Semantic Intent Classification Server...")
     logger.info(f"Server will run on http://{SERVER_HOST}:{SERVER_PORT}")
-    logger.info(f"Configuration:")
-    logger.info(f"  Default threshold: {DEFAULT_THRESHOLD}")
-    logger.info(f"  Max features: {MAX_FEATURES}")
-    logger.info(f"  N-gram range: {NGRAM_MIN}-{NGRAM_MAX}")
-    logger.info(f"  Debug mode: {DEBUG_MODE}")
+    logger.info(f"Method: Semantic Embeddings + Configurable LLM Validation")
+    logger.info(f"Default threshold: {DEFAULT_THRESHOLD}")
     
-    # Auto-load data if path is provided
-    qa_data_path = os.getenv('QA_DATA_PATH', '')
-    if qa_data_path and os.path.exists(qa_data_path):
-        try:
-            with open(qa_data_path, 'r', encoding='utf-8') as f:
-                qa_data = json.load(f)
-            
-            if isinstance(qa_data, dict) and 'qna' in qa_data:
-                qa_data = qa_data['qna']
-            elif not isinstance(qa_data, list):
-                qa_data = [qa_data]
-            
-            global intent_matcher
-            intent_matcher = IntentMatcher(qa_data)
-            logger.info(f"Auto-loaded {len(qa_data)} Q&A pairs from {qa_data_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to auto-load data from {qa_data_path}: {e}")
+    # Check for API keys
+    openai_key = os.getenv('OPENAI_API_KEY')
+    anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+    
+    if openai_key:
+        logger.info("OpenAI API key found")
+    else:
+        logger.warning("OPENAI_API_KEY not found in environment")
+    
+    if anthropic_key:
+        logger.info("Anthropic API key found")
+    else:
+        logger.warning("ANTHROPIC_API_KEY not found in environment")
+    
+    if not openai_key and not anthropic_key:
+        logger.error("At least one API key (OpenAI or Anthropic) is required!")
+        sys.exit(1)
     
     # Run server
     uvicorn.run(
